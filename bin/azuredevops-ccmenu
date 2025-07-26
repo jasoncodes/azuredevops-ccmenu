@@ -1,0 +1,141 @@
+#!/usr/bin/env ruby
+
+require 'open3'
+require 'json'
+require 'net/http'
+require 'rexml/document'
+require 'rexml/formatters/pretty'
+require 'webrick'
+
+def get_project_dir(name)
+  project_dir = File.expand_path("~/projects/#{name}")
+  unless name.match?(/\A[A-Z0-9_-]+\z/i) && Dir.exist?(project_dir)
+    raise ArgumentError, "invalid name: #{name.inspect}"
+  end
+
+  project_dir
+end
+
+def git_current_branch(path)
+  stdout, stderr, status = Open3.capture3(*%W[
+    git
+    -C #{path}
+    symbolic-ref --short -q HEAD
+  ])
+
+  unless status.success? && stderr.empty?
+    raise stderr
+  end
+
+  stdout.strip
+end
+
+def azure_devops_token
+  stdout, stderr, status = Open3.capture3(*%w[
+    az account get-access-token --resource 499b84ac-1321-427f-aa17-267ca6975798
+  ])
+
+  unless status.success? && stderr.empty?
+    raise stderr
+  end
+
+  JSON.parse(stdout).fetch("accessToken")
+end
+
+def get_devops_build(org:, project:, definition:, branch:)
+  uri = URI("https://dev.azure.com/#{org}/#{project}/_apis/build/builds")
+  uri.query = URI.encode_www_form({
+    "api-version" => "7.1-preview.7",
+    "queryOrder" => "startTimeDescending",
+    "$top" => 1,
+    "definitions" => definition,
+    "branchName" => branch && "refs/heads/#{branch}",
+  })
+
+  http = Net::HTTP.new(uri.host, uri.port)
+  http.use_ssl = true
+  request = Net::HTTP::Get.new(uri.request_uri)
+  request['Authorization'] = "Bearer #{azure_devops_token}"
+
+  response = http.request(request)
+  builds = JSON.parse(response.body).fetch("value")
+
+  builds.first
+end
+
+def devops_build_to_cc_project(build:, label_prefix:)
+  buildStatus = build && case build.fetch('result')
+  when 'succeeded'
+    'Success'
+  when 'failed'
+    'Failure'
+  else
+    'Unknown'
+  end
+
+  {
+    name: build.fetch('definition').fetch('name'),
+    activity: build&.fetch('status') == 'inProgress' ? 'Building' : 'Sleeping',
+    lastBuildStatus: build && buildStatus,
+    lastBuildLabel: build && [label_prefix, build.fetch("buildNumber")].join(' ').strip,
+    lastBuildTime: build && build.fetch("startTime"),
+    webUrl: build && build.fetch("_links").fetch("web").fetch("href"),
+  }.compact
+end
+
+def cc_project_xml(project)
+  xml = REXML::Document.new
+  xml.add_element("Projects")
+  xml.root.add_element("Project", project.transform_keys(&:to_s))
+
+  formatter = REXML::Formatters::Pretty.new
+  formatter.compact = true
+
+  io = StringIO.new
+  formatter.write(xml, io)
+  io.puts
+
+  io.string
+end
+
+server = WEBrick::HTTPServer.new(
+  BindAddress: ENV.fetch('BIND', '127.0.0.1'),
+  Port: Integer(ENV.fetch('PORT', '39419')),
+  AccessLog: [],
+)
+
+server.mount_proc '/build.xml' do |request, response|
+  org = request.query.fetch('org')
+  project = request.query.fetch('project')
+  definition = request.query.fetch('definition')
+  checkout = request.query.fetch('checkout', nil)
+  branch = request.query.fetch('branch', nil)
+
+  if checkout
+    project_dir = get_project_dir(checkout)
+    branch ||= git_current_branch(project_dir)
+  end
+
+  build = get_devops_build(
+    org: org,
+    project: project,
+    definition: definition,
+    branch: branch,
+  )
+
+  branch ||= build&.fetch('sourceBranch')&.delete_prefix('refs/heads/')
+
+  cc_project = devops_build_to_cc_project(
+    build: build,
+    label_prefix: branch,
+  )
+
+  xml = cc_project_xml(cc_project)
+
+  response.status = 200
+  response['Content-Type'] = 'application/xml; charset=utf-8'
+  response.body = xml
+end
+
+trap("INT") { server.shutdown }
+server.start
